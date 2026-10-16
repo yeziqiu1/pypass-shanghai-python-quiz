@@ -292,6 +292,7 @@ const questionMap = Object.fromEntries(QUESTIONS.map(q => [q.id, q]));
 const levelText = {'23':'二三级', '3':'三级强化'};
 const typeText = {choice:'单选题', fill:'程序填空', self:'编程自评'};
 const diffText = {1:'基础', 2:'常考', 3:'进阶'};
+const APP_VERSION = '2026.10.16.2';
 
 function todayKey(d = new Date()) {
   const y = d.getFullYear();
@@ -301,7 +302,7 @@ function todayKey(d = new Date()) {
 }
 function defaultState() {
   return {
-    records: {}, favorites: [], notes: {}, unitNotes: {}, freeNotes: [], read: {}, activity: {},
+    records: {}, favorites: [], notes: {}, unitNotes: {}, freeNotes: [], disputes: {}, read: {}, activity: {},
     goals: { daily: 20, auto: true }, settings: { immediate: true },
     ai: { provider:'local', baseUrl:'', apiKey:'', model:'', temperature:0.3 }, aiHistory: [],
     createdAt: new Date().toISOString()
@@ -368,6 +369,7 @@ function getRecord(id) {
 function ensureRecord(id) { if (!state.records[id]) state.records[id] = getRecord(id); return state.records[id]; }
 function recordResult(id, correct) {
   const r = ensureRecord(id);
+  r._lastImpact={correct,key:todayKey(),mode:ui.session?.mode||'',programming:questionMap[id]?.type==='self'};
   r.attempts += 1;
   if (correct) { r.correct += 1; r.correctStreak += 1; } else { r.wrong += 1; r.correctStreak = 0; }
   r.lastResult = correct ? 'correct' : 'wrong';
@@ -953,6 +955,36 @@ function restoreMastered(id) {
   const r=ensureRecord(id); r.mastered=false; r.correctStreak=0; r.review=true;
   saveState(); render(); showToast('已重新加入复习');
 }
+function undoLastResult(id) {
+  const r=ensureRecord(id); const hist=[...(r.history||[])]; if(!hist.length) return;
+  const last=hist.pop(); r.history=hist;
+  r.attempts=Math.max(0,(r.attempts||0)-1);
+  if(last.correct) r.correct=Math.max(0,(r.correct||0)-1); else r.wrong=Math.max(0,(r.wrong||0)-1);
+  let streak=0; for(let i=hist.length-1;i>=0&&hist[i].correct;i--) streak++; r.correctStreak=streak;
+  r.lastResult=hist.length?(hist[hist.length-1].correct?'correct':'wrong'):null; r.lastAt=hist.length?hist[hist.length-1].at:null;
+  const imp=r._lastImpact; if(imp){ const a=state.activity[imp.key]; if(a){ a.answered=Math.max(0,(a.answered||0)-1); if(imp.correct)a.correct=Math.max(0,(a.correct||0)-1); if(imp.mode==='wrong')a.wrongReview=Math.max(0,(a.wrongReview||0)-1); if(imp.programming)a.programming=Math.max(0,(a.programming||0)-1); } delete r._lastImpact; }
+  saveState();
+}
+function retryCurrentQuestion() {
+  const q=sessionQuestion(); if(!q||!ui.session?.answered) return;
+  undoLastResult(q.id); delete ui.session.results[q.id]; delete ui.session.questionState[q.id];
+  ui.session.answered=false; ui.session.result=null; ui.session.selected=null; ui.session.answerText=''; ui.session.selfRevealed=false;
+  render(); showToast('已撤销本题成绩，可以重新选择答案');
+}
+function buildQuestionReport(q,note='') {
+  const options=q.type==='choice'?q.options.map((x,i)=>`${'ABCD'[i]}. ${x}`).join('\n'):'';
+  const answer=q.type==='self'?'编程题':(Array.isArray(q.answer)?q.answer.join(' / '):q.answer);
+  return `题目编号：${q.id}\n章节：${chapterMap[q.chapter]?.name||''}\n题型：${typeText[q.type]||q.type}\n\n题干：${q.question}\n${q.code?`\n代码：\n${q.code}\n`:''}${options?`\n选项：\n${options}\n`:''}\n题库标注答案：${answer}\n解析：${q.explanation}\n\n我的说明：${note||'（请填写你认为哪里错了）'}`;
+}
+function openQuestionReport() {
+  const q=sessionQuestion(); if(!q) return; const old=state.disputes?.[q.id]?.note||'';
+  const body=`<div class="callout"><b>${q.id}</b><br>${esc(q.question)}</div><div class="field" style="margin-top:12px"><label>你认为哪里有问题？</label><textarea id="disputeNote" style="min-height:130px" placeholder="例如：正确答案应是 B；解析中的输出写错了；选项重复……">${esc(old)}</textarea></div><div class="small muted" style="margin-top:8px">保存后会记录在当前浏览器；点“提交到 GitHub”会打开一个已填好题目内容的 Issue 页面。</div>`;
+  openModal('题目纠错',body,`<button class="btn primary" data-action="submit-question-report">提交到 GitHub</button><button class="btn" data-action="copy-question-report">复制报错内容</button><button class="btn" data-action="close-modal">取消</button>`);
+}
+function saveQuestionDispute() { const q=sessionQuestion(); if(!q) return ''; const note=document.getElementById('disputeNote')?.value.trim()||''; state.disputes=state.disputes||{}; state.disputes[q.id]={note,at:new Date().toISOString()}; saveState(); return note; }
+function copyQuestionReport() { const q=sessionQuestion(); if(!q) return; const note=saveQuestionDispute(); const text=buildQuestionReport(q,note); const done=()=>{closeModal();render();showToast('报错内容已复制');}; if(navigator.clipboard?.writeText) navigator.clipboard.writeText(text).then(done).catch(()=>fallbackCopy(text,done)); else fallbackCopy(text,done); }
+function fallbackCopy(text,after) { const ta=document.createElement('textarea'); ta.value=text; document.body.appendChild(ta); ta.select(); try{document.execCommand('copy');}catch(e){} ta.remove(); if(after)after(); }
+function submitQuestionReport() { const q=sessionQuestion(); if(!q) return; const note=saveQuestionDispute(); const title=`[题目纠错] ${q.id} ${q.question.slice(0,40)}`; const url=`https://github.com/yeziqiu1/pypass-shanghai-python-quiz/issues/new?title=${encodeURIComponent(title)}&body=${encodeURIComponent(buildQuestionReport(q,note))}`; closeModal(); render(); window.open(url,'_blank','noopener'); showToast('已打开 GitHub 报错页面'); }
 function markCurrentMastered() {
   const q=sessionQuestion(); if(!q) return;
   const r=ensureRecord(q.id); r.mastered=true; r.correctStreak=2; r.wrong=0; r.review=false; r.lastResult='correct'; r.lastAt=new Date().toISOString();
@@ -971,11 +1003,12 @@ function renderMasteryControls(q) {
 function renderFeedback(q) {
   const good = ui.session.result === 'correct';
   const answer = q.type === 'choice' ? q.answer : (q.answer || []).join(' / ');
-  return `<div class="feedback ${good?'good':'bad'}"><div class="feedback-head"><span>${good?'✓ 回答正确':'× 需要复盘'}</span><span class="badge ${good?'green':'red'}">${q.id}</span></div><div><b>正确答案：</b><code>${esc(answer)}</code></div><p><b>解析：</b>${esc(q.explanation)}</p><div class="ai-explain-row"><button class="btn primary small" data-action="ask-ai-current">AI 自动讲解本题</button><span>不用复制，系统会带上完整题干和答案</span></div>${renderMasteryControls(q)}</div>`;
+  const disputed=!!state.disputes?.[q.id];
+  return `<div class="feedback ${good?'good':'bad'}"><div class="feedback-head"><span>${good?'✓ 回答正确':'× 需要复盘'}</span><span class="badge ${good?'green':'red'}">${q.id}</span></div><div><b>正确答案：</b><code>${esc(answer)}</code></div><p><b>解析：</b>${esc(q.explanation)}</p><div class="ai-explain-row"><button class="btn primary small" data-action="ask-ai-current">AI 自动讲解本题</button><span>不用复制，系统会带上完整题干和答案</span></div>${renderMasteryControls(q)}<div class="fb-actions" style="margin-top:10px"><button class="btn small" data-action="retry-current">修改本题答案</button><button class="btn small ${disputed?'amber':''}" data-action="report-question">${disputed?'已报错':'题目报错'}</button></div></div>`;
 }
 
 function renderSelfReference(q) {
-  return `<div class="feedback good" style="margin-top:16px"><div class="feedback-head">参考实现</div><pre style="margin-top:8px"><code>${esc(q.modelAnswer)}</code></pre><p><b>思路：</b>${esc(q.explanation)}</p>${ui.session.answered?`<div class="ai-explain-row"><button class="btn primary small" data-action="ask-ai-current">AI 自动讲解本题</button><span>题干、代码和参考实现会自动带入</span></div>`+renderMasteryControls(q):`<div class="fb-actions"><button class="btn primary small" data-action="self-correct">我写对了</button><button class="btn small danger" data-action="self-wrong">需要复盘</button></div>`}</div>`;
+  return `<div class="feedback good" style="margin-top:16px"><div class="feedback-head">参考实现</div><pre style="margin-top:8px"><code>${esc(q.modelAnswer)}</code></pre><p><b>思路：</b>${esc(q.explanation)}</p>${ui.session.answered?`<div class="ai-explain-row"><button class="btn primary small" data-action="ask-ai-current">AI 自动讲解本题</button><span>题干、代码和参考实现会自动带入</span></div>`+renderMasteryControls(q)+`<div class="fb-actions" style="margin-top:10px"><button class="btn small" data-action="retry-current">修改本题答案</button><button class="btn small" data-action="report-question">题目报错</button></div>`:`<div class="fb-actions"><button class="btn primary small" data-action="self-correct">我写对了</button><button class="btn small danger" data-action="self-wrong">需要复盘</button></div>`}</div>`;
 }
 
 function nextUnitInfo() {
@@ -1034,13 +1067,22 @@ function markMastered(id) {
   const r = ensureRecord(id); r.wrong = 0; r.correctStreak = 2; r.mastered = true; r.lastResult = 'correct'; r.lastAt = new Date().toISOString();
   saveState(); render(); showToast('已标记为掌握');
 }
+function checkForUpdate() {
+  const done=()=>{showToast('已清理旧缓存，正在刷新');setTimeout(()=>location.reload(),500);};
+  try{
+    const tasks=[];
+    if(navigator.serviceWorker){tasks.push(navigator.serviceWorker.getRegistrations().then(rs=>Promise.all(rs.map(r=>r.update()))));}
+    if(window.caches){tasks.push(caches.keys().then(keys=>Promise.all(keys.map(k=>caches.delete(k)))));}
+    Promise.all(tasks).then(done).catch(done);
+  }catch(e){done();}
+}
 function openSettings() {
   const body = `<div class="grid cols-2">
     <div class="field"><label>每日目标题量</label><input id="goalInput" type="number" min="5" max="200" value="${state.goals.daily}"></div>
-    <div class="field"><label>数据保存在哪里</label><input value="当前浏览器本地" disabled></div>
+    <div class="field"><label>当前版本</label><input value="${APP_VERSION}" disabled></div>
   </div>
   <div class="callout" style="margin-top:15px">刷题记录、收藏和错题都保存在当前浏览器。换浏览器、清理站点数据或更换电脑前，建议先导出备份。</div>
-  <div style="display:flex;gap:9px;flex-wrap:wrap;margin-top:15px"><button class="btn primary" data-action="save-goal">保存目标</button><button class="btn" data-action="auto-goal">按考试时间自动计算</button><button class="btn" data-action="export-data">导出备份</button><button class="btn" data-action="import-data">导入备份</button><button class="btn danger" data-action="reset-data">清空记录</button><input id="importFile" type="file" accept="application/json,.json" class="hidden"></div>`;
+  <div style="display:flex;gap:9px;flex-wrap:wrap;margin-top:15px"><button class="btn primary" data-action="save-goal">保存目标</button><button class="btn" data-action="auto-goal">按考试时间自动计算</button><button class="btn" data-action="check-update">检查更新</button><button class="btn" data-action="export-data">导出备份</button><button class="btn" data-action="import-data">导入备份</button><button class="btn danger" data-action="reset-data">清空记录</button><input id="importFile" type="file" accept="application/json,.json" class="hidden"></div>`;
   openModal('数据与设置', body);
 }
 function exportData() {
@@ -1360,6 +1402,11 @@ function saveQuickNote() {
 }
 function handleAction(action, el) {
   const id = el?.dataset?.id;
+  if(action==='retry-current'){retryCurrentQuestion();return;}
+  if(action==='report-question'){openQuestionReport();return;}
+  if(action==='submit-question-report'){submitQuestionReport();return;}
+  if(action==='copy-question-report'){copyQuestionReport();return;}
+  if(action==='check-update'){checkForUpdate();return;}
   if (action === 'go-notebook') setView('notebook');
   else if (action === 'save-unit-note') saveUnitNote(el.dataset.unit);
   else if (action === 'clear-unit-note') deleteUnitNote(el.dataset.unit);
